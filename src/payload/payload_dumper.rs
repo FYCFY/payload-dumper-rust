@@ -1,7 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_compression::tokio::bufread::{BzDecoder, XzDecoder, ZstdDecoder};
 use async_trait::async_trait;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs::File;
@@ -9,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}
 
 pub use crate::PartitionUpdate;
 use crate::args::Args;
+use crate::progress::{LogLevel, LogSink, ProgressReporter};
 use crate::{InstallOperation, install_operation};
 
 const BUFREADER_SIZE: usize = 64 * 1024; // 64 KB for BufReader (decompression streams)
@@ -42,6 +42,14 @@ impl AsyncPayloadRead for Arc<dyn AsyncPayloadRead> {
     }
 }
 
+/// 计算分区总字节数，供阶段总量与日志复用。
+pub fn partitions_total_size<'a>(parts: impl IntoIterator<Item = &'a PartitionUpdate>) -> u64 {
+    parts
+        .into_iter()
+        .filter_map(|p| p.new_partition_info.as_ref().and_then(|info| info.size))
+        .sum()
+}
+
 /// custom copy function with configurable buffer size
 async fn copy_with_buffer<R, W>(reader: &mut R, writer: &mut W) -> Result<u64>
 where
@@ -70,6 +78,7 @@ async fn process_operation_streaming(
     block_size: u64,
     payload_reader: &mut dyn PayloadReader,
     out_file: &mut File,
+    logger: &Arc<dyn LogSink>,
 ) -> Result<()> {
     let offset = data_offset + op.data_offset.unwrap_or(0);
     let length = op.data_length.unwrap_or(0);
@@ -95,9 +104,12 @@ async fn process_operation_streaming(
             match copy_with_buffer(&mut decoder, out_file).await {
                 Ok(_) => {}
                 Err(e) => {
-                    println!(
-                        "  Warning: Skipping operation {} due to XZ decompression error: {}",
-                        operation_index, e
+                    logger.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "Skipping operation {} due to XZ decompression error: {}",
+                            operation_index, e
+                        ),
                     );
                     return Ok(());
                 }
@@ -114,9 +126,12 @@ async fn process_operation_streaming(
             match copy_with_buffer(&mut decoder, out_file).await {
                 Ok(_) => {}
                 Err(e) => {
-                    println!(
-                        "  Warning: Skipping operation {} due to BZ2 decompression error: {}",
-                        operation_index, e
+                    logger.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "Skipping operation {} due to BZ2 decompression error: {}",
+                            operation_index, e
+                        ),
                     );
                     return Ok(());
                 }
@@ -135,9 +150,12 @@ async fn process_operation_streaming(
                 match copy_with_buffer(&mut decoder, out_file).await {
                     Ok(_) => {}
                     Err(e) => {
-                        println!(
-                            "  Warning: Skipping operation {} due to Zstd decompression error: {}",
-                            operation_index, e
+                        logger.log(
+                            LogLevel::Warn,
+                            &format!(
+                                "Skipping operation {} due to Zstd decompression error: {}",
+                                operation_index, e
+                            ),
                         );
                         return Ok(());
                     }
@@ -159,18 +177,24 @@ async fn process_operation_streaming(
                                 out_file.write_all(&decompressed[pos..end_pos]).await?;
                                 pos = end_pos;
                             } else {
-                                println!(
-                                    "  Warning: Skipping extent in operation {} due to insufficient data.",
-                                    operation_index
+                                logger.log(
+                                    LogLevel::Warn,
+                                    &format!(
+                                        "Skipping extent in operation {} due to insufficient data.",
+                                        operation_index
+                                    ),
                                 );
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        println!(
-                            "  Warning: Skipping operation {} due to Zstd error: {}",
-                            operation_index, e
+                        logger.log(
+                            LogLevel::Warn,
+                            &format!(
+                                "Skipping operation {} due to Zstd error: {}",
+                                operation_index, e
+                            ),
                         );
                         return Ok(());
                     }
@@ -195,14 +219,16 @@ async fn process_operation_streaming(
         | install_operation::Type::BrotliBsdiff
         | install_operation::Type::Lz4diffBsdiff => {
             return Err(anyhow!(
-                "Operation {} is a differential OTA operation which is not supported",
-                operation_index
+                "Operation {operation_index} is a differential OTA operation which is not supported"
             ));
         }
         _ => {
-            println!(
-                "  Warning: Skipping operation {} due to unknown operation type",
-                operation_index
+            logger.log(
+                LogLevel::Warn,
+                &format!(
+                    "Skipping operation {} due to unknown operation type",
+                    operation_index
+                ),
             );
             return Ok(());
         }
@@ -216,25 +242,18 @@ pub async fn dump_partition<P: AsyncPayloadRead>(
     block_size: u64,
     args: &Args,
     payload_reader: &P,
-    multi_progress: Option<&MultiProgress>,
+    progress: &Arc<dyn ProgressReporter>,
+    logger: &Arc<dyn LogSink>,
 ) -> Result<()> {
     let partition_name = &partition.partition_name;
     let total_ops = partition.operations.len() as u64;
+    let total_bytes = partition
+        .new_partition_info
+        .as_ref()
+        .and_then(|info| info.size);
 
-    let progress_bar = if let Some(mp) = multi_progress {
-        let pb = mp.add(ProgressBar::new(100));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/white}] {percent}% - {msg}")
-                .unwrap()
-                .progress_chars("▰▱ "),
-        );
-        pb.enable_steady_tick(tokio::time::Duration::from_secs(1));
-        pb.set_message(format!("Processing {} ({} ops)", partition_name, total_ops));
-        Some(pb)
-    } else {
-        None
-    };
+    progress.stage_started("process", Some(partition_name), total_bytes);
+    progress.partition_started(partition_name, total_ops, total_bytes);
 
     let out_dir = &args.out;
     if args.out.to_string_lossy() != "-" {
@@ -254,24 +273,28 @@ pub async fn dump_partition<P: AsyncPayloadRead>(
 
     let mut reader = payload_reader.open_reader().await?;
 
-    for (i, op) in partition.operations.iter().enumerate() {
-        process_operation_streaming(i, op, data_offset, block_size, &mut *reader, &mut out_file)
+    let result = async {
+        for (i, op) in partition.operations.iter().enumerate() {
+            process_operation_streaming(
+                i,
+                op,
+                data_offset,
+                block_size,
+                &mut *reader,
+                &mut out_file,
+                logger,
+            )
             .await?;
 
-        if let Some(pb) = &progress_bar {
-            let percentage = ((i + 1) as f64 / total_ops as f64 * 100.0) as u64;
-            pb.set_position(percentage);
+            progress.partition_progress(partition_name, (i + 1) as u64, total_ops);
         }
+
+        out_file.flush().await?;
+        progress.partition_finished(partition_name);
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
-    out_file.flush().await?;
-
-    if let Some(pb) = progress_bar {
-        pb.finish_with_message(format!(
-            "✓ Completed {} ({} ops)",
-            partition_name, total_ops
-        ));
-    }
-
-    Ok(())
+    progress.stage_finished("process", Some(partition_name));
+    result
 }

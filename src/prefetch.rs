@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
 use tokio::fs::File;
@@ -10,7 +10,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
 use crate::args::Args;
-use crate::payload::payload_dumper::{AsyncPayloadRead, PayloadReader, dump_partition};
+use crate::payload::payload_dumper::{
+    AsyncPayloadRead, PayloadReader, dump_partition, partitions_total_size,
+};
+use crate::progress::{LogLevel, LogSink, ProgressReporter};
 use crate::readers::local_reader::LocalAsyncPayloadReader;
 use crate::readers::remote_zip_reader::RemoteAsyncZipPayloadReader;
 use crate::utils::format_elapsed_time;
@@ -66,13 +69,12 @@ async fn download_partition_data_to_path(
     range: &PartitionDataRange,
     temp_dir_path: &PathBuf,
     partition_name: &str,
-    progress_bar: &ProgressBar,
+    progress: &Arc<dyn ProgressReporter>,
+    global_downloaded: &Arc<AtomicU64>,
+    global_total: u64,
 ) -> Result<PathBuf> {
-    progress_bar.set_message(format!(
-        "Downloading {} ({:.2} MB)",
-        partition_name,
-        range.total_bytes as f64 / 1024.0 / 1024.0
-    ));
+    progress.stage_started("download", Some(partition_name), Some(range.total_bytes));
+    progress.partition_started(partition_name, 0, Some(range.total_bytes));
 
     let temp_path = temp_dir_path.join(format!("{}.prefetch", partition_name));
     let mut file = File::create(&temp_path).await?;
@@ -98,14 +100,23 @@ async fn download_partition_data_to_path(
         file.write_all(&buffer[..n]).await?;
 
         downloaded += n as u64;
-        let percent = (downloaded as f64 / total as f64 * 100.0) as u64;
-        progress_bar.set_position(percent);
+        progress.partition_bytes(partition_name, downloaded, total);
+        if global_total > 0 {
+            let agg = global_downloaded.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+            let capped = agg.min(global_total);
+            progress.stage_progress("download", None, capped, global_total);
+        }
     }
 
     file.flush().await?;
     drop(file);
 
-    progress_bar.finish_with_message(format!("✓ Downloaded {}", partition_name));
+    progress.partition_finished(partition_name);
+    progress.stage_finished("download", Some(partition_name));
+    if global_total > 0 {
+        let agg = global_downloaded.load(Ordering::Relaxed).min(global_total);
+        progress.stage_progress("download", None, agg, global_total);
+    }
 
     Ok(temp_path)
 }
@@ -169,26 +180,19 @@ pub async fn prefetch_and_extract(
     data_offset: u64,
     args: Arc<Args>,
     partitions_to_extract: Vec<PartitionUpdate>,
-    multi_progress: Arc<MultiProgress>,
+    progress: Arc<dyn ProgressReporter>,
+    logger: Arc<dyn LogSink>,
 ) -> Result<()> {
     let start_time = Instant::now();
 
-    let main_pb = multi_progress.add(ProgressBar::new_spinner());
-    main_pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    main_pb.enable_steady_tick(tokio::time::Duration::from_millis(300));
-
-    main_pb.set_message("Initializing prefetch mode...");
+    progress.overall_status("Initializing prefetch mode...");
 
     // mktmp
     let temp_dir = TempDir::new()?;
-    main_pb.println(format!(
-        "- Created temporary directory: {:?}",
-        temp_dir.path()
-    ));
+    logger.log(
+        LogLevel::Info,
+        &format!("Created temporary directory: {:?}", temp_dir.path()),
+    );
 
     // calculate ranges for all partitions
     let mut partition_info: HashMap<String, PartitionDataRange> = HashMap::new();
@@ -201,11 +205,15 @@ pub async fn prefetch_and_extract(
         }
     }
 
-    main_pb.println(format!(
-        "- Total data to download: {:.2} MB across {} partitions",
-        total_download_size as f64 / 1024.0 / 1024.0,
-        partition_info.len()
-    ));
+    logger.log(
+        LogLevel::Info,
+        &format!(
+            "Total data to download: {:.2} MB across {} partitions",
+            total_download_size as f64 / 1024.0 / 1024.0,
+            partition_info.len()
+        ),
+    );
+    progress.stage_started("download", None, Some(total_download_size));
 
     let thread_count = if args.no_parallel {
         1
@@ -217,13 +225,19 @@ pub async fn prefetch_and_extract(
 
     // get block size for extraction
     let block_size = manifest.block_size.unwrap_or(4096) as u64;
+    let total_process_size = partitions_total_size(partitions_to_extract.iter());
 
     // download and extract partitions as soon as each download completes
-    main_pb.set_message("Downloading and extracting partitions...");
+    progress.overall_status("Downloading and extracting partitions...");
+    progress.stage_started("process", None, Some(total_process_size));
 
     let download_semaphore = Arc::new(Semaphore::new(thread_count));
     let extract_semaphore = Arc::new(Semaphore::new(thread_count));
     let mut combined_tasks = Vec::new();
+    let global_downloaded = Arc::new(AtomicU64::new(0));
+    let download_completed = Arc::new(AtomicU64::new(0));
+    let download_done_flag = Arc::new(AtomicBool::new(false));
+    let download_total_parts = partition_info.len() as u64;
 
     for partition in &partitions_to_extract {
         let partition_name = partition.partition_name.clone();
@@ -233,21 +247,16 @@ pub async fn prefetch_and_extract(
             let temp_dir_path = temp_dir.path().to_path_buf();
             let partition = partition.clone();
             let args = Arc::clone(&args);
-            let multi_progress = Arc::clone(&multi_progress);
-
-            let download_pb = multi_progress.add(ProgressBar::new(100));
-            download_pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/white}] {percent}% - {msg}")
-                    .unwrap()
-                    .progress_chars("▰▱ "),
-            );
-            download_pb.enable_steady_tick(tokio::time::Duration::from_secs(1));
+            let progress = Arc::clone(&progress);
+            let logger = Arc::clone(&logger);
 
             let url = url.clone();
             let user_agent = args.user_agent.clone();
             let download_semaphore = Arc::clone(&download_semaphore);
             let extract_semaphore = Arc::clone(&extract_semaphore);
+            let global_downloaded = Arc::clone(&global_downloaded);
+            let download_completed = Arc::clone(&download_completed);
+            let download_done_flag = Arc::clone(&download_done_flag);
 
             // spawn combined download + extract task
             let task = tokio::spawn(async move {
@@ -264,13 +273,33 @@ pub async fn prefetch_and_extract(
                         &range,
                         &temp_dir_path,
                         &partition_name,
-                        &download_pb,
+                        &progress,
+                        &global_downloaded,
+                        total_download_size,
                     )
                     .await
                     .map_err(|e| (partition_name.clone(), e))?;
 
                     // release download permit before extraction
                     drop(_permit);
+
+                    let finished = download_completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if finished == download_total_parts
+                        && !download_done_flag.swap(true, Ordering::Relaxed)
+                    {
+                        let agg = if total_download_size > 0 {
+                            global_downloaded
+                                .load(Ordering::Relaxed)
+                                .min(total_download_size)
+                        } else {
+                            0
+                        };
+                        progress.stage_finished("download", None);
+                        if total_download_size > 0 {
+                            progress.stage_progress("download", None, agg, total_download_size);
+                        }
+                    }
+
                     temp_path
                 };
 
@@ -288,7 +317,8 @@ pub async fn prefetch_and_extract(
                     block_size,
                     &args,
                     &reader,
-                    Some(&multi_progress),
+                    &progress,
+                    &logger,
                 )
                 .await
                 .map_err(|e| (partition_name, e))
@@ -306,62 +336,79 @@ pub async fn prefetch_and_extract(
         match result {
             Ok(Ok(())) => {}
             Ok(Err((partition_name, error))) => {
-                eprintln!("Failed to process partition {}: {}", partition_name, error);
+                logger.log(
+                    LogLevel::Error,
+                    &format!("Failed to process partition {}: {}", partition_name, error),
+                );
                 failed_partitions.push(partition_name);
             }
             Err(e) => {
-                eprintln!("Task panicked: {}", e);
+                logger.log(LogLevel::Error, &format!("Task panicked: {}", e));
             }
         }
     }
 
-    main_pb.println("✓ All partitions downloaded and extracted");
+    progress.overall_status("Download & extract stage complete");
+    progress.stage_finished("process", None);
+    if !download_done_flag.swap(true, Ordering::Relaxed) {
+        let agg = if total_download_size > 0 {
+            global_downloaded
+                .load(Ordering::Relaxed)
+                .min(total_download_size)
+        } else {
+            0
+        };
+        progress.stage_finished("download", None);
+        if total_download_size > 0 {
+            progress.stage_progress("download", None, agg, total_download_size);
+        }
+    }
 
     if !args.no_verify {
-        main_pb.println("- Verifying partition hashes...");
+        logger.log(LogLevel::Info, "Verifying partition hashes...");
 
         let partitions_to_verify: Vec<&PartitionUpdate> = partitions_to_extract
             .iter()
             .filter(|p| !failed_partitions.contains(&p.partition_name))
             .collect();
 
-        match verify_partitions_hash(&partitions_to_verify, &args, &multi_progress).await {
+        match verify_partitions_hash(&partitions_to_verify, &args, &progress, &logger).await {
             Ok(failed_verifications) => {
                 if !failed_verifications.is_empty() {
-                    eprintln!(
-                        "Hash verification failed for {} partitions.",
-                        failed_verifications.len()
+                    logger.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "Hash verification failed for {} partitions.",
+                            failed_verifications.len()
+                        ),
                     );
                     failed_partitions.extend(failed_verifications);
                 }
             }
             Err(e) => {
-                eprintln!("Error during hash verification: {}", e);
+                logger.log(
+                    LogLevel::Error,
+                    &format!("Error during hash verification: {}", e),
+                );
             }
         }
     } else {
-        main_pb.println("- Skipping hash verification");
+        logger.log(LogLevel::Info, "Skipping hash verification");
     }
 
     let elapsed_time = format_elapsed_time(start_time.elapsed());
 
     if failed_partitions.is_empty() {
-        main_pb.finish_with_message(format!(
+        progress.done(&format!(
             "All partitions extracted successfully! (in {})",
             elapsed_time
         ));
     } else {
-        main_pb.finish_with_message(format!(
+        progress.done(&format!(
             "Completed with {} failed partitions. (in {})",
             failed_partitions.len(),
             elapsed_time
         ));
-        println!(
-            "\nExtraction completed with {} failed partitions in {}. Output directory: {:?}",
-            failed_partitions.len(),
-            elapsed_time,
-            args.out
-        );
     }
 
     Ok(())
